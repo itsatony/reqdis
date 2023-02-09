@@ -12,7 +12,7 @@ import (
 )
 
 // @title reqdis
-// @version 0.1.0
+// @version 0.2.0
 // @description ReqDis (short for request distributor) is a go-mod for distributed requests based on Redis pubsub
 // @contact.name Toni
 // @contact.email i+reqdis@itsaatony.com
@@ -46,7 +46,7 @@ func NewReqDisOptions() ReqDisOptions {
 // ========================= ReqDis
 
 func NewReqDis(redisClient redis.UniversalClient, options *ReqDisOptions) *ReqDis {
-	rd := ReqDis{}
+	var rd ReqDis = ReqDis{}
 	if options == nil {
 		opts := NewReqDisOptions()
 		options = &opts
@@ -54,8 +54,8 @@ func NewReqDis(redisClient redis.UniversalClient, options *ReqDisOptions) *ReqDi
 	rd.Options = options
 	rd.InstanceId = shortuuid.New()
 	rd.redisClient = redisClient
-	rd.AliveInstances = make(map[string]time.Time)
-	rd.ActiveJobs = make(map[string]*ReqDisJob)
+	rd.AliveInstances = sync.Map{} // make(map[string]time.Time)
+	rd.ActiveJobs = sync.Map{}     //make(map[string]*ReqDisJob)
 	rd.IncomingRequest = make(chan *ReqDisMessage, options.BufferSize)
 	// rd.CompletedJob = make(chan ReqDisJob, BufferSize)
 	rd.pruneInstancesTicker = time.NewTicker(options.InstancePruneInterval)
@@ -68,14 +68,14 @@ func NewReqDis(redisClient redis.UniversalClient, options *ReqDisOptions) *ReqDi
 }
 
 type ReqDis struct {
-	Options              *ReqDisOptions
-	InstanceId           string
-	redisClient          redis.UniversalClient
-	subscriber           *redis.PubSub
-	IncomingRequest      chan *ReqDisMessage
-	Safety               sync.Mutex
-	ActiveJobs           map[string]*ReqDisJob
-	AliveInstances       map[string]time.Time
+	Options         *ReqDisOptions
+	InstanceId      string
+	redisClient     redis.UniversalClient
+	subscriber      *redis.PubSub
+	IncomingRequest chan *ReqDisMessage
+	// Safety               sync.Mutex
+	ActiveJobs           sync.Map //map[string]*ReqDisJob
+	AliveInstances       sync.Map //map[string]time.Time
 	pruneInstancesTicker *time.Ticker
 	sendAliveTicker      *time.Ticker
 }
@@ -88,6 +88,14 @@ func (rd *ReqDis) MsgType_Request() string {
 }
 func (rd *ReqDis) MsgType_Reply() string {
 	return "reply"
+}
+func (rd *ReqDis) KnownInstanceCount() int {
+	var n int = 0
+	rd.AliveInstances.Range(func(key any, value any) bool {
+		n += 1
+		return true
+	})
+	return n
 }
 
 func (rd *ReqDis) pruneTicks() {
@@ -114,30 +122,36 @@ func (rd *ReqDis) getSubscribeTopic() (topic string) {
 }
 
 func (rd *ReqDis) PruneOldInstances() {
-	rd.Safety.Lock()
-	defer rd.Safety.Unlock()
 	IdsToRemove := []string{}
 	now := time.Now()
-	for id, t := range rd.AliveInstances {
-		if t.Before(now.Add(-rd.Options.InstancePruneInterval)) {
+
+	rd.AliveInstances.Range(func(key any, value any) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		lastAlive, ok := value.(time.Time)
+		if !ok {
+			return true
+		}
+		if lastAlive.Before(now.Add(-rd.Options.InstancePruneInterval)) {
 			IdsToRemove = append(IdsToRemove, id)
 		}
-	}
+		return true
+	})
 	for _, id := range IdsToRemove {
-		delete(rd.AliveInstances, id)
+		rd.AliveInstances.LoadAndDelete(id)
 	}
 }
 
-func (rd *ReqDis) AddJob(job *ReqDisJob) {
-	rd.Safety.Lock()
-	rd.ActiveJobs[job.Request.Id] = job
-	rd.Safety.Unlock()
+func (rd *ReqDis) AddJob(job *ReqDisJob) *ReqDis {
+	rd.ActiveJobs.Store(job.Request.Id, job)
+	return rd
 }
 
-func (rd *ReqDis) RemoveJob(requestId string) {
-	rd.Safety.Lock()
-	delete(rd.ActiveJobs, requestId)
-	rd.Safety.Unlock()
+func (rd *ReqDis) RemoveJob(requestId string) *ReqDis {
+	rd.ActiveJobs.LoadAndDelete(requestId)
+	return rd
 }
 
 func (rd *ReqDis) CreateTopic(rdm *ReqDisMessage) (topic string) {
@@ -155,7 +169,9 @@ func (rd *ReqDis) SendAlive() {
 
 func (rd *ReqDis) SendNewRequest(payloadType string, payload []byte) *ReqDisJob {
 	// we expect a reply own instance (1) + from every instance in our list!
-	rdm := NewReqDisMessage(rd.InstanceId, rd.MsgType_Request(), len(rd.AliveInstances))
+	count := rd.KnownInstanceCount()
+	mtype := rd.MsgType_Request()
+	rdm := NewReqDisMessage(rd.InstanceId, mtype, count)
 	rdm.SetPayload(payloadType, payload)
 	rdj := NewReqDisJob(rdm)
 	rd.AddJob(rdj)
@@ -172,11 +188,16 @@ func (rd *ReqDis) SendNewReply(RequestId string, payloadType string, payload []b
 }
 
 func (rd *ReqDis) handleReply(incomingMsg *ReqDisMessage) {
-	job, ok := rd.ActiveJobs[incomingMsg.ReplyToRequestId]
-	if !ok {
-		return
-	}
-	job.HandleReply(incomingMsg)
+	rd.ActiveJobs.Range(func(key any, value any) bool {
+		job, ok := value.(*ReqDisJob)
+		if !ok {
+			return true
+		}
+		if job.Request.Id == incomingMsg.ReplyToRequestId {
+			job.HandleReply(incomingMsg)
+		}
+		return true
+	})
 }
 
 func (rd *ReqDis) handleRequest(incomingMsg *ReqDisMessage) {
@@ -184,9 +205,7 @@ func (rd *ReqDis) handleRequest(incomingMsg *ReqDisMessage) {
 }
 
 func (rd *ReqDis) handleKeepAlive(incomingMsg *ReqDisMessage) {
-	rd.Safety.Lock()
-	rd.AliveInstances[incomingMsg.InstanceId] = time.Now()
-	rd.Safety.Unlock()
+	rd.AliveInstances.Store(incomingMsg.InstanceId, time.Now())
 }
 
 func (rd *ReqDis) subscribe() {

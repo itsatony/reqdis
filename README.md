@@ -10,6 +10,7 @@ ReqDis allows to not rely on or even require any single-source-of-truth - usuall
 
 ## VERSIONS
 
+* v0.2.0 moved to sync.Map for concurrency
 * v0.1.0 initial commit - isolated from a larger project
 
 ## INSTALL
